@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run pytest
+      - run: uv run python -m autodiff.train_toy
+      - run: uv run python -m autodiff.torch_port
+      - run: uv run python -m training.mnist_mlp --smoke
+      - run: uv run python -m capstone.train --steps 5 --dim 64 --layers 2 --heads 2 --seq 32 --vocab 128
