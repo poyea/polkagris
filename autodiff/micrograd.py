@@ -74,6 +74,22 @@ class Value:
         out._backward = _backward
         return out
 
+    def sigmoid(self) -> Value:
+        # Branch on the sign so the exp argument is never positive; exp(-x) for
+        # x = -1000 is the overflow that exp() above walks into head-on.
+        if self.data >= 0.0:
+            s = 1.0 / (1.0 + math.exp(-self.data))
+        else:
+            e = math.exp(self.data)
+            s = e / (1.0 + e)
+        out = Value(s, (self,), "sigmoid")
+
+        def _backward():
+            self.grad += s * (1 - s) * out.grad
+
+        out._backward = _backward
+        return out
+
     def backward(self) -> None:
         topo: list[Value] = []
         visited: set[Value] = set()

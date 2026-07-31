@@ -27,6 +27,23 @@ def test_tanh_matches_torch():
     assert abs(x.grad - xt.grad.item()) < 1e-12
 
 
+def test_sigmoid_matches_torch():
+    x = Value(0.7)
+    y = x.sigmoid()
+    y.backward()
+    xt = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    yt = torch.sigmoid(xt)
+    yt.backward()
+    assert abs(y.data - yt.item()) < 1e-12
+    assert abs(x.grad - xt.grad.item()) < 1e-12
+
+
+def test_sigmoid_survives_large_magnitude_inputs():
+    # The composed form (1 + (-x).exp()) ** -1.0 raises OverflowError at -1000.
+    assert Value(-1000.0).sigmoid().data == 0.0
+    assert Value(1000.0).sigmoid().data == 1.0
+
+
 def test_pow_relu_div():
     x = Value(3.0)
     y = (x**2.0) / 3.0 - 1.0

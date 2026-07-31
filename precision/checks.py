@@ -82,7 +82,43 @@ def a_gpu_is_needed_for_the_speed_story() -> str:
 
 
 def ops_autocast_keeps_in_fp32() -> str:
-    raise Pending("the fp32 keep-list is not enumerated here")
+    # Feeding each op both dtypes is what separates the three policies. An op
+    # that returns fp32 from fp32 input proves nothing: it may be on the keep
+    # list, or it may just be following its input. Only bf16 in / fp32 out is
+    # a genuine cast back up. The lists are registered per device type, so this
+    # enumerates the CPU policy; CUDA registers its own, longer fp32 list.
+    def probe(dtype: torch.dtype) -> dict[str, torch.dtype]:
+        x = torch.randn(8, 64, dtype=dtype)
+        w = torch.randn(64, 64, dtype=dtype)
+        target = torch.zeros(8, dtype=torch.long)
+        ops = {
+            "linear": lambda: torch.nn.functional.linear(x, w),
+            "matmul": lambda: x @ w,
+            "softmax": lambda: torch.softmax(x, -1),
+            "layer_norm": lambda: torch.nn.functional.layer_norm(x, (64,)),
+            "exp": lambda: x.exp(),
+            "sum": lambda: x.sum(),
+            "prod": lambda: x.prod(),
+            "cross_entropy": lambda: torch.nn.functional.cross_entropy(x, target),
+            "mse_loss": lambda: torch.nn.functional.mse_loss(x, x),
+            "relu": lambda: torch.relu(x),
+        }
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return {name: fn().dtype for name, fn in ops.items()}
+
+    from_fp32, from_bf16 = probe(torch.float32), probe(torch.bfloat16)
+    widened = [k for k, v in from_fp32.items() if v is torch.bfloat16]
+    kept = [k for k, v in from_bf16.items() if v is torch.float32]
+    followed = [k for k in from_fp32 if k not in widened and k not in kept]
+
+    assert "linear" in widened, f"autocast is not active: linear returned {from_fp32['linear']}"
+    assert kept, "expected at least one op to cast back up to fp32"
+    assert "relu" in followed, f"relu should follow its input, got {from_bf16['relu']}"
+    return (
+        f"cast down: {', '.join(widened)}; kept in fp32 even from bf16 input: "
+        f"{', '.join(kept)}; the other {len(followed)} just follow their input "
+        f"({', '.join(followed)}); on CPU the keep-list is this short"
+    )
 
 
 def accuracy_under_bf16() -> str:
