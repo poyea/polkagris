@@ -22,6 +22,14 @@ rope = reference.rope
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # The kernel writes into a fresh `torch.empty_like`, so its output carries no
+    # grad_fn and nothing upstream of attention would receive a gradient. Under
+    # autograd that trains a fraction of the model while the loss still falls, so
+    # refuse rather than let a backward pass look like it worked.
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        raise NotImplementedError(
+            "triton attention is forward-only: it has no backward pass"
+        )
     b, h, t, d = q.shape
     out = tiled_attention(
         q.reshape(b * h, t, d), k.reshape(b * h, t, d), v.reshape(b * h, t, d)

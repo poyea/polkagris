@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import torch
 
@@ -17,9 +18,21 @@ from polkagris.checks import Pending, Skip, run
 SMALL = ModelConfig(vocab_size=65, dim=64, n_layers=2, n_heads=4, seq_len=32)
 
 
-def build() -> Transformer:
+def build(ops: str = "reference") -> Transformer:
     set_seed()
-    return Transformer(SMALL)
+    return Transformer(replace(SMALL, ops=ops))
+
+
+def available_backends() -> list[str]:
+    """Backends importable here. Anything gated on platform drops out."""
+    kinds = []
+    for kind in ("reference", "triton"):
+        try:
+            get_ops(kind)
+        except (ImportError, RuntimeError):
+            continue
+        kinds.append(kind)
+    return kinds
 
 
 def initial_loss_is_the_log_of_the_vocabulary() -> str:
@@ -105,15 +118,34 @@ def attention_is_causal() -> str:
 
 
 def the_backward_pass_touches_every_parameter() -> str:
-    model = build()
-    tokens = torch.randint(0, SMALL.vocab_size, (2, 16))
-    logits = model(tokens)
-    torch.nn.functional.cross_entropy(
-        logits.view(-1, SMALL.vocab_size), tokens.view(-1)
-    ).backward()
-    missing = [n for n, p in model.named_parameters() if p.grad is None]
-    assert not missing, f"no gradient reached {missing}"
-    return f"all {len(list(model.parameters()))} parameter tensors received a gradient"
+    # Every backend, not just the default: a kernel that drops the autograd graph
+    # trains a fraction of the model while the loss still falls, and asserting
+    # this against `reference` alone can never catch that.
+    notes = []
+    for kind in available_backends():
+        model = build(kind)
+        tokens = torch.randint(0, SMALL.vocab_size, (2, 16))
+        logits = model(tokens)
+        torch.nn.functional.cross_entropy(
+            logits.view(-1, SMALL.vocab_size), tokens.view(-1)
+        ).backward()
+        missing = [n for n, p in model.named_parameters() if p.grad is None]
+        assert not missing, f"[{kind}] no gradient reached {missing}"
+        notes.append(f"{kind}: all {len(list(model.parameters()))} tensors")
+    return "; ".join(notes)
+
+
+def a_forward_only_backend_refuses_to_train() -> str:
+    """A kernel with no backward must raise, not silently detach the graph."""
+    if "triton" not in available_backends():
+        raise Skip("triton ops unavailable here")
+    ops = get_ops("triton")
+    q, k, v = (torch.randn(1, 4, 32, 16, device="cuda", requires_grad=True) for _ in range(3))
+    try:
+        ops.attention(q, k, v)
+    except NotImplementedError:
+        return "triton attention refuses a grad-enabled call instead of detaching"
+    raise AssertionError("triton attention accepted a grad-enabled call; gradients are lost")
 
 
 def swiglu_hidden_size_is_two_thirds_of_four_x() -> str:
@@ -146,6 +178,7 @@ CHECKS = [
     rmsnorm_ignores_the_mean,
     attention_is_causal,
     the_backward_pass_touches_every_parameter,
+    a_forward_only_backend_refuses_to_train,
     the_triton_backend_needs_a_triton_box,
     memory_ceiling_and_bf16_recovery,
 ]
