@@ -45,9 +45,10 @@ class BenchResult:
     device: str
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def save(self) -> Path:
-        BENCH_DIR.mkdir(parents=True, exist_ok=True)
-        path = BENCH_DIR / f"{self.name}.json"
+    def save(self, out_dir: Path | None = None) -> Path:
+        directory = out_dir or BENCH_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{self.name}.json"
         path.write_text(json.dumps(asdict(self), indent=2))
         return path
 
@@ -57,9 +58,15 @@ def benchmark(
     name: str,
     warmup: int = 10,
     reps: int = 50,
+    save: bool = True,
+    out_dir: Path | None = None,
     **extra: Any,
 ) -> BenchResult:
-    """Time fn() with warmup. Uses CUDA events on GPU, perf_counter on CPU."""
+    """Time fn() with warmup. Uses CUDA events on GPU, perf_counter on CPU.
+
+    `save=False` times without touching disk; `out_dir` redirects the JSON, so a
+    test never writes into the results directory the dashboard reads.
+    """
     use_cuda = torch.cuda.is_available()
     for _ in range(warmup):
         fn()
@@ -87,5 +94,6 @@ def benchmark(
         device="cuda" if use_cuda else "cpu",
         extra=extra,
     )
-    result.save()
+    if save:
+        result.save(out_dir)
     return result
