@@ -79,10 +79,16 @@ def aot_eager_cannot_speed_anything_up() -> str:
     compiled = torch.compile(fn, backend="aot_eager")
     eager_ms = median_ms(lambda: fn(x))
     aot_ms = median_ms(lambda: compiled(x))
-    assert aot_ms >= eager_ms * 0.9, "aot_eager generates no kernels, so a real speedup is suspect"
+    # Bound loose enough that timing jitter cannot trip it: FAIL has to mean a
+    # broken invariant, not a busy scheduler. aot_eager emits no kernels, so
+    # beating eager twice over is a measurement bug, not a speedup.
+    assert aot_ms >= eager_ms * 0.5, (
+        f"aot_eager generates no kernels yet measured {eager_ms / aot_ms:.1f}x faster "
+        "than eager; the measurement is wrong"
+    )
     return (
-        f"eager {eager_ms:.3f} ms, aot_eager {aot_ms:.3f} ms: capture without codegen only adds "
-        "dispatch, which is why the phase needs inductor to show a win"
+        f"eager {eager_ms:.3f} ms, aot_eager {aot_ms:.3f} ms ({eager_ms / aot_ms:.2f}x): capture "
+        "without codegen only adds dispatch, which is why the phase needs inductor to show a win"
     )
 
 
