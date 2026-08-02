@@ -1,7 +1,7 @@
 # Copyright (c) 2026 John Law
 # SPDX-License-Identifier: MIT
 
-"""Run: python -m gpu_basics.checks"""
+"""Run: python -m cuda_primitives.checks"""
 
 from __future__ import annotations
 
@@ -92,4 +92,4 @@ CHECKS = [
 ]
 
 if __name__ == "__main__":
-    raise SystemExit(run("gpu_basics", CHECKS))
+    raise SystemExit(run("cuda_primitives", CHECKS))
