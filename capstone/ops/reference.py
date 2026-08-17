@@ -25,4 +25,14 @@ def rope(q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor, theta: float
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    t_q, t_k = q.shape[-2], k.shape[-2]
+    if t_q == t_k:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    # A cache makes k longer than q, and `is_causal` aligns its mask to the top
+    # left, which would pin a decode step to position 0. Align bottom right: the
+    # i-th query is at absolute position t_k - t_q + i.
+    offset = t_k - t_q
+    q_pos = torch.arange(t_q, device=q.device)[:, None] + offset
+    k_pos = torch.arange(t_k, device=q.device)[None, :]
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=k_pos <= q_pos)

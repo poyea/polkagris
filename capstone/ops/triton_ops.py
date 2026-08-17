@@ -30,6 +30,12 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
         raise NotImplementedError(
             "triton attention is forward-only: it has no backward pass"
         )
+    # The kernel derives one seq_len from q and writes into empty_like(q), so a
+    # longer k would be read past its tile bounds against a mask built for q.
+    if k.shape[-2] != q.shape[-2]:
+        raise NotImplementedError(
+            f"triton attention needs q and k the same length, got {q.shape[-2]} and {k.shape[-2]}"
+        )
     b, h, t, d = q.shape
     out = tiled_attention(
         q.reshape(b * h, t, d), k.reshape(b * h, t, d), v.reshape(b * h, t, d)

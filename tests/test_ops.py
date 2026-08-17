@@ -42,3 +42,23 @@ def test_attention_is_causal():
     v[..., -1, :] = 100.0
     out2 = ops.attention(q, k, v)
     assert torch.allclose(out1[..., :-1, :], out2[..., :-1, :], atol=1e-5)
+
+
+def test_single_query_against_a_cache_sees_the_whole_cache():
+    """The decode case. is_causal would align top-left and pin this to key 0."""
+    q = torch.randn(1, 1, 6, 8)
+    k = torch.randn(1, 1, 6, 8)
+    v = torch.randn(1, 1, 6, 8)
+    full = ops.attention(q, k, v)
+    last = ops.attention(q[:, :, -1:], k, v)
+    assert torch.allclose(full[:, :, -1:], last, atol=1e-5)
+
+
+def test_a_partial_query_block_stays_causal():
+    """Prefill against an existing cache: mask aligns bottom right, not top left."""
+    q = torch.randn(1, 1, 6, 8)
+    k = torch.randn(1, 1, 6, 8)
+    v = torch.randn(1, 1, 6, 8)
+    full = ops.attention(q, k, v)
+    tail = ops.attention(q[:, :, 4:], k, v)
+    assert torch.allclose(full[:, :, 4:], tail, atol=1e-5)
