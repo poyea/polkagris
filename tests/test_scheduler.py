@@ -46,9 +46,10 @@ def test_generated_excludes_the_prompt():
     sched.submit(Request(prompt=[7, 8, 9]))
     seq = sched.admit()[0]
     assert seq.generated == []
+    assert seq.position == 3
     seq.tokens.append(42)
     assert seq.generated == [42]
-    assert seq.position == 3
+    assert seq.position == 4
 
 
 def test_finish_on_token_budget():
@@ -75,7 +76,9 @@ def test_finish_on_context_limit():
     sched = make(max_seq_len=8)
     sched.submit(Request(prompt=[1], max_new_tokens=99))
     seq = sched.admit()[0]
-    seq.position = 8
+    seq.tokens.extend(range(6))
+    assert not sched._is_finished(seq)
+    seq.tokens.append(9)
     assert sched._is_finished(seq)
 
 

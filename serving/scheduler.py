@@ -36,9 +36,13 @@ class Sequence:
 
     request: Request
     slot: int
-    position: int
     tokens: list[int]
     done: bool = False
+
+    @property
+    def position(self) -> int:
+        """Next write index, which is also how many tokens the slot holds."""
+        return len(self.tokens)
 
     @property
     def generated(self) -> list[int]:
@@ -84,7 +88,6 @@ class Scheduler:
             sequence = Sequence(
                 request=request,
                 slot=self._free.pop(0),
-                position=len(request.prompt),
                 tokens=list(request.prompt),
             )
             self.running[sequence.slot] = sequence
