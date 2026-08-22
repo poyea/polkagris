@@ -35,6 +35,16 @@ class KVCache:
         first = self.entries[0]
         return 0 if first is None else first[0].shape[-2]
 
+    def append(
+        self, layer: int, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        past = self.entries[layer]
+        if past is not None:
+            k = torch.cat([past[0], k], dim=2)
+            v = torch.cat([past[1], v], dim=2)
+        self.entries[layer] = (k, v)
+        return k, v
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, ops):
@@ -59,20 +69,20 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache=None,
+        layer: int = 0,
         key_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         b, t, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = (
             z.view(b, t, self.n_heads, self.head_dim).transpose(1, 2) for z in (q, k, v)
         )
         q, k = self.ops.rope(q, k, positions)
-        if past is not None:
-            k = torch.cat([past[0], k], dim=2)
-            v = torch.cat([past[1], v], dim=2)
+        if cache is not None:
+            k, v = cache.append(layer, k, v)
         out = self.ops.attention(q, k, v, key_mask)
-        return self.proj(out.transpose(1, 2).reshape(b, t, -1)), (k, v)
+        return self.proj(out.transpose(1, 2).reshape(b, t, -1))
 
 
 class SwiGLU(nn.Module):
@@ -98,12 +108,12 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache=None,
+        layer: int = 0,
         key_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        attn_out, present = self.attn(self.attn_norm(x), positions, past, key_mask)
-        x = x + attn_out
-        return x + self.mlp(self.mlp_norm(x)), present
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), positions, cache, layer, key_mask)
+        return x + self.mlp(self.mlp_norm(x))
 
 
 class Transformer(nn.Module):
@@ -126,7 +136,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        cache: KVCache | None = None,
+        cache=None,
         positions: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -136,10 +146,7 @@ class Transformer(nn.Module):
             positions = torch.arange(start, start + t, device=tokens.device)
         x = self.embed(tokens)
         for i, block in enumerate(self.blocks):
-            past = cache.entries[i] if cache is not None else None
-            x, present = block(x, positions, past, key_mask)
-            if cache is not None:
-                cache.entries[i] = present
+            x = block(x, positions, cache, i, key_mask)
         return self.lm_head(self.norm(x))
 
     @torch.no_grad()
