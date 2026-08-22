@@ -113,3 +113,66 @@ def test_greedy_generation_is_deterministic():
     first = model.generate(prompt, max_new_tokens=6, temperature=0.0)
     second = model.generate(prompt, max_new_tokens=6, temperature=0.0)
     assert torch.equal(first, second)
+
+
+def slot_cache_for(model, cfg, capacity=1):
+    from serving.cache import SlotCache
+
+    return SlotCache(
+        len(model.blocks), capacity, cfg.n_heads, cfg.seq_len, cfg.dim // cfg.n_heads
+    )
+
+
+def test_a_slot_cache_prefills_the_same_as_a_growing_one():
+    """The padded tail must not change a single logit."""
+    cfg = tiny_config()
+    model = Transformer(cfg).eval()
+    tokens = torch.randint(0, 64, (1, 5))
+    with torch.no_grad():
+        want = model(tokens, KVCache(len(model.blocks)))
+        cache = slot_cache_for(model, cfg)
+        cache.reserve(5)
+        got = model(tokens, cache, torch.arange(5)[None], cache.key_mask())
+    assert torch.allclose(want, got, atol=1e-5)
+
+
+def test_a_slot_cache_decodes_the_same_as_a_growing_one():
+    cfg = tiny_config()
+    model = Transformer(cfg).eval()
+    tokens = torch.randint(0, 64, (1, 6))
+    with torch.no_grad():
+        growing = KVCache(len(model.blocks))
+        model(tokens[:, :4], growing)
+        want = [model(tokens[:, i : i + 1], growing) for i in range(4, 6)]
+
+        cache = slot_cache_for(model, cfg)
+        cache.reserve(4)
+        model(tokens[:, :4], cache, torch.arange(4)[None], cache.key_mask())
+        got = []
+        for i in range(4, 6):
+            cache.reserve(1)
+            got.append(
+                model(tokens[:, i : i + 1], cache, torch.tensor([[i]]), cache.key_mask())
+            )
+    for a, b in zip(want, got):
+        assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_an_idle_slot_cannot_change_a_live_one():
+    """Two rows, one never admitted: the live row must decode as if alone."""
+    cfg = tiny_config()
+    model = Transformer(cfg).eval()
+    tokens = torch.randint(0, 64, (1, 4))
+    live = torch.tensor([True, False])
+    with torch.no_grad():
+        alone = slot_cache_for(model, cfg, capacity=1)
+        alone.reserve(4)
+        want = model(tokens, alone, torch.arange(4)[None], alone.key_mask())
+
+        shared = slot_cache_for(model, cfg, capacity=2)
+        shared.reserve(4, live)
+        pair = tokens.expand(2, 4)
+        got = model(
+            pair, shared, torch.arange(4)[None].expand(2, 4), shared.key_mask()
+        )
+    assert torch.allclose(want[0], got[0], atol=1e-5)

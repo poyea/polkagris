@@ -81,7 +81,7 @@ class Attention(nn.Module):
         q, k = self.ops.rope(q, k, positions)
         if cache is not None:
             k, v = cache.append(layer, k, v)
-        out = self.ops.attention(q, k, v, key_mask)
+        out = self.ops.attention(q, k, v, key_mask, positions)
         return self.proj(out.transpose(1, 2).reshape(b, t, -1))
 
 

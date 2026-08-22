@@ -33,23 +33,30 @@ def attention(
     k: torch.Tensor,
     v: torch.Tensor,
     key_mask: torch.Tensor | None = None,
+    q_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Causal attention. `key_mask` is [batch, t_k], True where a key is real.
+    """Causal attention.
 
-    Batched sequences of different lengths share one cache tensor, so the unused
-    tail of a shorter row has to be masked out rather than attended to.
+    `key_mask` is [batch, t_k], True where a key is real. `q_positions` is the
+    absolute position of each query; give it whenever the keys do not end at the
+    query, which is what a preallocated cache with a padded tail looks like.
     """
     t_q, t_k = q.shape[-2], k.shape[-2]
-    if key_mask is None and t_q == t_k:
+    if key_mask is None and q_positions is None and t_q == t_k:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-    # A cache makes k longer than q, and `is_causal` aligns its mask to the top
-    # left, which would pin a decode step to position 0. Align bottom right: the
-    # i-th query is at absolute position t_k - t_q + i.
-    offset = t_k - t_q
-    q_pos = torch.arange(t_q, device=q.device)[:, None] + offset
-    k_pos = torch.arange(t_k, device=q.device)[None, :]
-    mask = k_pos <= q_pos
+    k_index = torch.arange(t_k, device=q.device)
+    if q_positions is None:
+        # Nothing says where the queries sit, so assume they are the tail of k.
+        # `is_causal` would instead align to the top left and pin a decode step
+        # to position 0.
+        q_index = torch.arange(t_q, device=q.device)[:, None] + (t_k - t_q)
+        mask = (k_index[None, :] <= q_index)[None, None]
+    else:
+        # A key at buffer index j holds the token at absolute position j, so the
+        # query's own position is what decides which keys it may read.
+        positions = q_positions if q_positions.ndim == 2 else q_positions[None]
+        mask = (k_index <= positions[..., None])[:, None]
     if key_mask is not None:
-        mask = mask[None, None] & key_mask[:, None, None, :]
+        mask = mask & key_mask[:, None, None, :]
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)

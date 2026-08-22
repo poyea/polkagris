@@ -37,8 +37,9 @@ class DetachedOps:
         k: torch.Tensor,
         v: torch.Tensor,
         key_mask: torch.Tensor | None = None,
+        q_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return reference.attention(q, k, v, key_mask).detach()
+        return reference.attention(q, k, v, key_mask, q_positions).detach()
 
 
 def small_config(vocab_size: int, dim: int = 128, layers: int = 4, seq: int = 128) -> ModelConfig:
