@@ -69,6 +69,8 @@ class Scheduler:
         self._free = list(range(capacity))
 
     def submit(self, request: Request) -> None:
+        if not request.prompt:
+            raise ValueError("prompt is empty: decoding needs a token to condition on")
         if len(request.prompt) >= self.max_seq_len:
             raise ValueError(
                 f"prompt of {len(request.prompt)} tokens does not fit in {self.max_seq_len}"

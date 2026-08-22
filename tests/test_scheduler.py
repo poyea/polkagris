@@ -88,6 +88,12 @@ def test_a_prompt_that_cannot_fit_is_refused_at_submit():
         sched.submit(Request(prompt=[1, 2, 3, 4]))
 
 
+def test_an_empty_prompt_is_refused_at_submit():
+    sched = make()
+    with pytest.raises(ValueError, match="empty"):
+        sched.submit(Request(prompt=[]))
+
+
 def test_capacity_must_be_positive():
     with pytest.raises(ValueError, match="at least 1"):
         Scheduler(model=None, capacity=0, max_seq_len=8)
