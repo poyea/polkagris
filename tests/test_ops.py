@@ -62,3 +62,37 @@ def test_a_partial_query_block_stays_causal():
     full = ops.attention(q, k, v)
     tail = ops.attention(q[:, :, 4:], k, v)
     assert torch.allclose(full[:, :, 4:], tail, atol=1e-5)
+
+
+def test_rope_accepts_per_sequence_positions():
+    """Batched sequences sit at different absolute positions."""
+    q = torch.randn(2, 2, 1, 16)
+    k = torch.randn(2, 2, 1, 16)
+    batched = torch.tensor([[3], [7]])
+    q_b, k_b = ops.rope(q, k, batched)
+    for row, pos in enumerate((3, 7)):
+        q_r, k_r = ops.rope(q[row : row + 1], k[row : row + 1], torch.tensor([pos]))
+        assert torch.allclose(q_b[row : row + 1], q_r, atol=1e-5)
+        assert torch.allclose(k_b[row : row + 1], k_r, atol=1e-5)
+
+
+def test_key_mask_excludes_padded_slots():
+    """A shorter row must not attend to the unused tail it shares with a longer one."""
+    q = torch.randn(1, 1, 1, 8)
+    k = torch.randn(1, 1, 5, 8)
+    v = torch.randn(1, 1, 5, 8)
+    mask = torch.tensor([[True, True, True, False, False]])
+    masked = ops.attention(q, k, v, mask)
+    trimmed = ops.attention(q, k[:, :, :3], v[:, :, :3])
+    assert torch.allclose(masked, trimmed, atol=1e-5)
+
+
+def test_key_mask_ignores_junk_in_the_padded_tail():
+    q = torch.randn(1, 1, 1, 8)
+    k = torch.randn(1, 1, 4, 8)
+    v = torch.randn(1, 1, 4, 8)
+    mask = torch.tensor([[True, True, False, False]])
+    before = ops.attention(q, k, v, mask)
+    k[:, :, 2:] = 1e4
+    v[:, :, 2:] = 1e4
+    assert torch.allclose(before, ops.attention(q, k, v, mask), atol=1e-5)

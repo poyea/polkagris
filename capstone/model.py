@@ -60,6 +60,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         b, t, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -70,7 +71,7 @@ class Attention(nn.Module):
         if past is not None:
             k = torch.cat([past[0], k], dim=2)
             v = torch.cat([past[1], v], dim=2)
-        out = self.ops.attention(q, k, v)
+        out = self.ops.attention(q, k, v, key_mask)
         return self.proj(out.transpose(1, 2).reshape(b, t, -1)), (k, v)
 
 
@@ -98,8 +99,9 @@ class Block(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        attn_out, present = self.attn(self.attn_norm(x), positions, past)
+        attn_out, present = self.attn(self.attn_norm(x), positions, past, key_mask)
         x = x + attn_out
         return x + self.mlp(self.mlp_norm(x)), present
 
@@ -121,14 +123,21 @@ class Transformer(nn.Module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        cache: KVCache | None = None,
+        positions: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         _, t = tokens.shape
-        start = len(cache) if cache is not None else 0
-        positions = torch.arange(start, start + t, device=tokens.device)
+        if positions is None:
+            start = len(cache) if cache is not None else 0
+            positions = torch.arange(start, start + t, device=tokens.device)
         x = self.embed(tokens)
         for i, block in enumerate(self.blocks):
             past = cache.entries[i] if cache is not None else None
-            x, present = block(x, positions, past)
+            x, present = block(x, positions, past, key_mask)
             if cache is not None:
                 cache.entries[i] = present
         return self.lm_head(self.norm(x))

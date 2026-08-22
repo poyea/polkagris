@@ -9,7 +9,6 @@ import math
 import statistics as st
 
 import torch
-import torch.nn.functional as F
 
 from capstone.data import CharCorpus
 from capstone.model import ModelConfig, Transformer
@@ -33,8 +32,13 @@ class DetachedOps:
     rope = staticmethod(reference.rope)
 
     @staticmethod
-    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True).detach()
+    def attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return reference.attention(q, k, v, key_mask).detach()
 
 
 def small_config(vocab_size: int, dim: int = 128, layers: int = 4, seq: int = 128) -> ModelConfig:

@@ -21,7 +21,15 @@ rmsnorm = reference.rmsnorm
 rope = reference.rope
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    key_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # The kernel bakes causality into its tile bounds and takes no mask operand.
+    if key_mask is not None:
+        raise NotImplementedError("triton attention takes no key mask")
     # The kernel writes into a fresh `torch.empty_like`, so its output carries no
     # grad_fn and nothing upstream of attention would receive a gradient. Under
     # autograd that trains a fraction of the model while the loss still falls, so
