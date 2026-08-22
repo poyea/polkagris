@@ -1,6 +1,7 @@
 # Copyright (c) 2026 John Law
 # SPDX-License-Identifier: MIT
 
+import pytest
 import torch
 
 from capstone.model import KVCache, ModelConfig, Transformer
@@ -96,6 +97,13 @@ def test_generate_stops_at_the_context_limit():
 def test_generate_leaves_training_mode_untouched():
     model = Transformer(tiny_config()).train()
     model.generate(torch.randint(0, 64, (1, 2)), max_new_tokens=2)
+    assert model.training
+
+
+def test_generate_restores_training_mode_when_a_step_raises():
+    model = Transformer(tiny_config()).train()
+    with pytest.raises(IndexError):
+        model.generate(torch.tensor([[9999]]), max_new_tokens=2)
     assert model.training
 
 

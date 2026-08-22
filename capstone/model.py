@@ -160,25 +160,27 @@ class Transformer(nn.Module):
         cache = KVCache(len(self.blocks))
         step = tokens
         out = tokens
-        for _ in range(max_new_tokens):
-            # Cap on what is returned, not on what is cached: the token a step
-            # samples is appended without being fed back, so checking the cache
-            # would let the sequence end one past the context.
-            if out.shape[1] >= self.cfg.seq_len:
-                break
-            logits = self(step, cache)[:, -1]
-            if temperature == 0.0:
-                nxt = logits.argmax(dim=-1, keepdim=True)
-            else:
-                logits = logits / temperature
-                if top_k is not None:
-                    kth = logits.topk(min(top_k, logits.shape[-1]), dim=-1).values[:, -1:]
-                    logits = logits.masked_fill(logits < kth, float("-inf"))
-                nxt = torch.multinomial(logits.softmax(dim=-1), num_samples=1)
-            out = torch.cat([out, nxt], dim=1)
-            step = nxt
-        if was_training:
-            self.train()
+        try:
+            for _ in range(max_new_tokens):
+                # Cap on what is returned, not on what is cached: the token a
+                # step samples is appended without being fed back, so checking
+                # the cache would let the sequence end one past the context.
+                if out.shape[1] >= self.cfg.seq_len:
+                    break
+                logits = self(step, cache)[:, -1]
+                if temperature == 0.0:
+                    nxt = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    logits = logits / temperature
+                    if top_k is not None:
+                        kth = logits.topk(min(top_k, logits.shape[-1]), dim=-1).values[:, -1:]
+                        logits = logits.masked_fill(logits < kth, float("-inf"))
+                    nxt = torch.multinomial(logits.softmax(dim=-1), num_samples=1)
+                out = torch.cat([out, nxt], dim=1)
+                step = nxt
+        finally:
+            if was_training:
+                self.train()
         return out
 
     def num_params(self) -> int:
