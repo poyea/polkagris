@@ -80,8 +80,11 @@ class Scheduler:
         return len(self.waiting) + len(self.running)
 
     def admit(self) -> list[Sequence]:
-        """Move waiting requests into free slots. Prefill is not batched yet:
-        each admission runs its own prompt pass before joining the decode batch."""
+        """Move waiting requests into free slots.
+
+        Allocation only. Filling a new slot's cache with its prompt is the
+        decode loop's work, and happens on the step after admission.
+        """
         admitted = []
         while self.waiting and self._free:
             request = self.waiting.pop(0)
