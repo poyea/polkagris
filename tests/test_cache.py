@@ -126,9 +126,8 @@ def test_each_row_writes_at_its_own_offset():
     assert cache.lengths.tolist() == [4, 1]
     assert keys[0, 0, :4, 0].tolist() == [1.0, 1.0, 1.0, 4.0]
     assert keys[1, 0, 0, 0].item() == 4.0
-    # Position 1 still holds what the inactive pass wrote, and the mask
-    # is what keeps it out of the arithmetic.
-    assert keys[1, 0, 1, 0].item() == 1.0
+    # The pass row 1 sat out never touched it, so nothing was left behind.
+    assert keys[1, 0, 1, 0].item() == 0.0
     assert cache.key_mask()[1].tolist() == [True] + [False] * 7
 
 
@@ -149,3 +148,24 @@ def test_reserve_needs_a_positive_width():
     cache = make()
     with pytest.raises(ValueError, match="at least 1"):
         cache.reserve(0)
+
+
+def test_a_full_idle_row_does_not_break_the_write():
+    """A slot at the end of its window must not take the whole batch down."""
+    cache = make(capacity=2, max_seq_len=4)
+    cache.reserve(4, torch.tensor([True, False]))
+    cache.append(0, *kv(cache, 4, 1.0))
+    cache.reserve(1, torch.tensor([False, True]))
+    keys, _ = cache.append(0, *kv(cache, 1, 3.0))
+    assert cache.lengths.tolist() == [4, 1]
+    assert keys[1, 0, 0, 0].item() == 3.0
+    assert keys[0, 0, :4, 0].tolist() == [1.0] * 4
+
+
+def test_a_write_narrower_than_the_pool_is_refused():
+    """One row's keys would otherwise broadcast into every slot."""
+    cache = make(capacity=3)
+    cache.reserve(2)
+    one = torch.full((1, 2, 2, 4), 7.0)
+    with pytest.raises(ValueError, match="pool holds 3 rows"):
+        cache.append(0, one, one)

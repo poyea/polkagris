@@ -37,6 +37,7 @@ class SlotCache:
         self.values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
         self.lengths = torch.zeros(capacity, dtype=torch.long, device=device)
         self._start: torch.Tensor | None = None
+        self._active: torch.Tensor | None = None
         self._width = 0
 
     def reset(self, slot: int) -> None:
@@ -55,10 +56,10 @@ class SlotCache:
             raise ValueError(f"width must be at least 1, got {width}")
         if active is None:
             active = torch.ones(self.capacity, dtype=torch.bool, device=self.lengths.device)
-        over = self.lengths[active] + width > self.max_seq_len
-        if bool(over.any()):
+        if bool((self.lengths[active] + width > self.max_seq_len).any()):
             raise ValueError(f"slot would run past the {self.max_seq_len} token window")
         self._start = self.lengths.clone()
+        self._active = active
         self._width = width
         self.lengths = self.lengths + width * active.long()
 
@@ -68,10 +69,23 @@ class SlotCache:
             raise RuntimeError("reserve() must claim positions before a layer appends")
         if k.shape[-2] != self._width:
             raise ValueError(f"reserved {self._width} positions, got {k.shape[-2]}")
-        rows = torch.arange(self.capacity, device=k.device)[:, None]
-        cols = self._start[:, None] + torch.arange(self._width, device=k.device)
-        self.keys[layer][rows, :, cols, :] = k.transpose(1, 2).to(self.keys[layer].dtype)
-        self.values[layer][rows, :, cols, :] = v.transpose(1, 2).to(self.values[layer].dtype)
+        # A batch of one would broadcast into every row of the pool, filling
+        # unrelated slots with one sequence's keys and marking them valid.
+        if k.shape[0] != self.capacity or v.shape[0] != self.capacity:
+            raise ValueError(
+                f"pool holds {self.capacity} rows, got {k.shape[0]} keys and {v.shape[0]} values"
+            )
+        # Only the rows reserve claimed. An inactive row may already sit at the
+        # end of its window, and writing it would run off the buffer over a
+        # position its own mask excludes anyway.
+        rows = self._active.nonzero(as_tuple=True)[0].to(k.device)
+        cols = self._start[rows][:, None] + torch.arange(self._width, device=k.device)
+        self.keys[layer][rows[:, None], :, cols, :] = (
+            k[rows].transpose(1, 2).to(self.keys[layer].dtype)
+        )
+        self.values[layer][rows[:, None], :, cols, :] = (
+            v[rows].transpose(1, 2).to(self.values[layer].dtype)
+        )
         return self.keys[layer], self.values[layer]
 
     def key_mask(self) -> torch.Tensor:
