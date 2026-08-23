@@ -112,3 +112,42 @@ def test_pending_counts_both_queued_and_running():
 
 def test_request_ids_are_unique():
     assert Request(prompt=[1]).id != Request(prompt=[1]).id
+
+
+def test_retiring_twice_is_refused():
+    """A second retire would hand the same slot to two sequences at once."""
+    sched = make(capacity=1)
+    sched.submit(Request(prompt=[1]))
+    seq = sched.admit()[0]
+    sched.retire(seq)
+    with pytest.raises(ValueError, match="not running"):
+        sched.retire(seq)
+    assert sched._free == [0]
+
+
+def test_retiring_something_never_admitted_is_refused():
+    from serving.scheduler import Sequence
+
+    sched = make(capacity=2)
+    stray = Sequence(request=Request(prompt=[1]), slot=99, tokens=[1])
+    with pytest.raises(ValueError, match="not running"):
+        sched.retire(stray)
+    assert sched._free == [0, 1]
+
+
+def test_a_stale_copy_cannot_evict_the_live_sequence():
+    from serving.scheduler import Sequence
+
+    sched = make(capacity=1)
+    sched.submit(Request(prompt=[1]))
+    live = sched.admit()[0]
+    stale = Sequence(request=live.request, slot=live.slot, tokens=[1])
+    with pytest.raises(ValueError, match="not running"):
+        sched.retire(stale)
+    assert sched.running[live.slot] is live
+
+
+def test_a_request_that_generates_nothing_is_refused():
+    sched = make()
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        sched.submit(Request(prompt=[1], max_new_tokens=0))

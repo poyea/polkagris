@@ -71,6 +71,8 @@ class Scheduler:
     def submit(self, request: Request) -> None:
         if not request.prompt:
             raise ValueError("prompt is empty: decoding needs a token to condition on")
+        if request.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be at least 1, got {request.max_new_tokens}")
         if len(request.prompt) >= self.max_seq_len:
             raise ValueError(
                 f"prompt of {len(request.prompt)} tokens does not fit in {self.max_seq_len}"
@@ -100,8 +102,13 @@ class Scheduler:
         return admitted
 
     def retire(self, sequence: Sequence) -> None:
+        # Keyed on identity, not on the slot number. A stale copy carrying the
+        # same slot would otherwise evict the sequence still decoding on it, and
+        # a second retire would hand the same slot out twice.
+        if self.running.get(sequence.slot) is not sequence:
+            raise ValueError(f"slot {sequence.slot} is not running this sequence")
         sequence.done = True
-        self.running.pop(sequence.slot, None)
+        del self.running[sequence.slot]
         self._free.append(sequence.slot)
         self.finished.append(sequence)
 
