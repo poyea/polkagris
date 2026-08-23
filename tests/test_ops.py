@@ -141,3 +141,50 @@ def test_an_uncached_forward_keeps_the_fused_causal_path():
                                         "attention": staticmethod(watching)})()
     model(torch.randint(0, 32, (1, 6)))
     assert seen and all(seen), "the model gave up the fused causal path"
+
+
+def reference_attention(q, k, v, allowed):
+    """Softmax attention against an explicitly given boolean mask."""
+    scores = (q @ k.transpose(-1, -2)) / (q.shape[-1] ** 0.5)
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    return scores.softmax(dim=-1) @ v
+
+
+def test_positions_mask_matches_a_hand_built_one():
+    """Independent oracle. Both slot-cache tests would agree with each other
+    even if this mask were wrong, because both sides run this same code."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 1, 3, 8)
+    k = torch.randn(1, 1, 6, 8)
+    v = torch.randn(1, 1, 6, 8)
+    positions = torch.tensor([[0, 1, 2]])
+    allowed = torch.tensor([[True, False, False, False, False, False],
+                            [True, True, False, False, False, False],
+                            [True, True, True, False, False, False]])
+    want = reference_attention(q, k, v, allowed[None, None])
+    assert torch.allclose(ops.attention(q, k, v, None, positions), want, atol=1e-5)
+
+
+def test_a_query_attends_to_its_own_position():
+    """The diagonal. Dropping it leaves query 0 attending to nothing."""
+    q = torch.randn(1, 1, 1, 8)
+    k = torch.randn(1, 1, 4, 8)
+    v = torch.randn(1, 1, 4, 8)
+    out = ops.attention(q, k, v, None, torch.tensor([[0]]))
+    assert torch.allclose(out[0, 0, 0], v[0, 0, 0], atol=1e-5)
+
+
+def test_each_row_uses_its_own_query_position():
+    """Rows at different absolute positions, which is the batched decode case."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 1, 1, 8)
+    k = torch.randn(2, 1, 5, 8)
+    v = torch.randn(2, 1, 5, 8)
+    positions = torch.tensor([[1], [4]])
+    got = ops.attention(q, k, v, None, positions)
+    for row, pos in enumerate((1, 4)):
+        want = reference_attention(
+            q[row : row + 1], k[row : row + 1], v[row : row + 1],
+            (torch.arange(5) <= pos)[None, None, None],
+        )
+        assert torch.allclose(got[row : row + 1], want, atol=1e-5)
