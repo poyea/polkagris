@@ -81,7 +81,12 @@ class Attention(nn.Module):
         q, k = self.ops.rope(q, k, positions)
         if cache is not None:
             k, v = cache.append(layer, k, v)
-        out = self.ops.attention(q, k, v, key_mask, positions)
+        # Absolute positions are only needed when the keys do not end at the
+        # query, which is what a padded cache looks like and what key_mask
+        # signals. Sending them unconditionally costs the fused causal path and
+        # hands every backend an operand some of them cannot take.
+        q_positions = positions if key_mask is not None else None
+        out = self.ops.attention(q, k, v, key_mask, q_positions)
         return self.proj(out.transpose(1, 2).reshape(b, t, -1))
 
 

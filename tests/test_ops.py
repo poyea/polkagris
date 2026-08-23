@@ -96,3 +96,48 @@ def test_key_mask_ignores_junk_in_the_padded_tail():
     k[:, :, 2:] = 1e4
     v[:, :, 2:] = 1e4
     assert torch.allclose(before, ops.attention(q, k, v, mask), atol=1e-5)
+
+
+class StrictOps:
+    """A backend that takes only q, k, v, as the triton kernel does."""
+
+    rmsnorm = staticmethod(ops.rmsnorm)
+    rope = staticmethod(ops.rope)
+
+    @staticmethod
+    def attention(q, k, v, key_mask=None, q_positions=None):
+        if key_mask is not None or q_positions is not None:
+            raise NotImplementedError("this backend takes no mask or position operand")
+        return ops.attention(q, k, v)
+
+
+def test_an_uncached_forward_sends_no_mask_or_positions():
+    """A backend that takes only q, k, v must still be able to run the model."""
+    from capstone.model import ModelConfig, Transformer
+
+    cfg = ModelConfig(vocab_size=32, dim=16, n_layers=2, n_heads=2, seq_len=8)
+    model = Transformer(cfg)
+    for block in model.blocks:
+        block.attn.ops = StrictOps()
+    model(torch.randint(0, 32, (1, 6)))
+
+
+def test_an_uncached_forward_keeps_the_fused_causal_path():
+    """The fused path is what is_causal buys; an explicit mask gives it up."""
+    from capstone.model import ModelConfig, Transformer
+
+    seen = []
+    real = ops.attention
+
+    def watching(q, k, v, key_mask=None, q_positions=None):
+        seen.append(key_mask is None and q_positions is None and q.shape[-2] == k.shape[-2])
+        return real(q, k, v, key_mask, q_positions)
+
+    cfg = ModelConfig(vocab_size=32, dim=16, n_layers=2, n_heads=2, seq_len=8)
+    model = Transformer(cfg)
+    for block in model.blocks:
+        block.attn.ops = type("W", (), {"rmsnorm": staticmethod(ops.rmsnorm),
+                                        "rope": staticmethod(ops.rope),
+                                        "attention": staticmethod(watching)})()
+    model(torch.randint(0, 32, (1, 6)))
+    assert seen and all(seen), "the model gave up the fused causal path"
