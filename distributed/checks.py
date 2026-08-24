@@ -65,12 +65,31 @@ def gradient_accumulation_imitates_a_bigger_batch() -> str:
     return "two half batches with the loss divided by two match one full batch, no extra memory"
 
 
-def a_process_group_of_one_still_CHECKS_the_wrapping() -> str:
+def a_process_group_of_one_still_checks_the_wrapping() -> str:
     if not torch.distributed.is_available():
         raise Skip("this torch build has no distributed support")
     backends = [b for b in ("gloo", "nccl") if getattr(torch.distributed, f"is_{b}_available")()]
     assert backends, "no usable backend found"
-    return f"backends available: {', '.join(backends)}; ddp_cifar runs at world size 1 on any of them"
+
+    # Build the group and wrap a module, rather than reporting that a backend
+    # exists and calling that a verified run.
+    import tempfile
+    from pathlib import Path
+
+    from torch.nn.parallel import DistributedDataParallel
+
+    backend = "nccl" if torch.cuda.is_available() and torch.distributed.is_nccl_available() else "gloo"
+    store = Path(tempfile.mkdtemp()) / "checks_store"
+    torch.distributed.init_process_group(
+        backend=backend, init_method=f"file:///{store.as_posix()}", rank=0, world_size=1
+    )
+    try:
+        model = DistributedDataParallel(nn.Linear(4, 2))
+        model(torch.randn(3, 4)).sum().backward()
+        assert all(p.grad is not None for p in model.parameters()), "no gradient survived the wrap"
+    finally:
+        torch.distributed.destroy_process_group()
+    return f"backends available: {', '.join(backends)}; wrapped and stepped a module over {backend}"
 
 
 def real_scaling_needs_a_second_device() -> str:
@@ -88,7 +107,7 @@ CHECKS = [
     averaging_shard_gradients_equals_one_big_batch,
     summing_instead_of_averaging_scales_the_learning_rate,
     gradient_accumulation_imitates_a_bigger_batch,
-    a_process_group_of_one_still_CHECKS_the_wrapping,
+    a_process_group_of_one_still_checks_the_wrapping,
     real_scaling_needs_a_second_device,
     communication_overlaps_compute,
 ]

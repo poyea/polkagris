@@ -23,7 +23,10 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     args = parser.parse_args()
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    # A CUDA build is not a NCCL build. Windows wheels ship without NCCL, so
+    # asking for it there fails at init rather than falling back.
+    use_nccl = torch.cuda.is_available() and dist.is_nccl_available()
+    backend = "nccl" if use_nccl else "gloo"
     if "RANK" in os.environ:
         dist.init_process_group(backend=backend)
     else:
