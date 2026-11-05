@@ -77,8 +77,8 @@ def a_gpu_is_needed_for_the_speed_story() -> str:
     if not torch.cuda.is_available():
         raise Skip("no CUDA device")
     name = torch.cuda.get_device_name(0)
-    major = torch.cuda.get_device_capability(0)[0]
-    return f"{name} (sm_{major}x): tensor cores from sm_70, so check what you are on"
+    major, minor = torch.cuda.get_device_capability(0)
+    return f"{name}: compute capability {major}.{minor}"
 
 
 def ops_autocast_keeps_in_fp32() -> str:
