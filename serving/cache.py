@@ -12,6 +12,10 @@ reads the buffer where it lies instead of gathering the live rows into a
 smaller tensor, which would copy the history back. Idle rows are carried
 through the arithmetic and excluded by the mask, so the pool is sized for the
 concurrency it is meant to serve.
+
+The window is a ceiling, not a cost. Attention sees the buffer only up to the
+longest live sequence, so a pool declared with room for long contexts is not
+paying for that room while every row is still short.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ class SlotCache:
         self._start: torch.Tensor | None = None
         self._active: torch.Tensor | None = None
         self._width = 0
+        self._high = 0
 
     def reset(self, slot: int) -> None:
         """Hand a slot back. Stale keys stay in the buffer, out of reach of the
@@ -62,9 +67,24 @@ class SlotCache:
         self._active = active
         self._width = width
         self.lengths = self.lengths + width * active.long()
+        # The high-water mark across the pool, read once here rather than per
+        # layer, since every append and the mask have to agree on one width and
+        # reading it back from the device is a sync.
+        self._high = int(self.lengths.max())
+
+    @property
+    def high(self) -> int:
+        """Positions in use, counted from the longest row in the pool."""
+        return self._high
 
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Write this layer's new keys and values, then return the whole buffer."""
+        """Write this layer's new keys and values, then return what is in use.
+
+        The slice is a view, so nothing is copied, and it starts at 0 so a
+        buffer index still equals an absolute position. Returning the whole
+        window instead would make every step cost the context the pool was
+        declared for rather than the one it is holding.
+        """
         if self._start is None:
             raise RuntimeError("reserve() must claim positions before a layer appends")
         if k.shape[-2] != self._width:
@@ -86,9 +106,13 @@ class SlotCache:
         self.values[layer][rows[:, None], :, cols, :] = (
             v[rows].transpose(1, 2).to(self.values[layer].dtype)
         )
-        return self.keys[layer], self.values[layer]
+        return self.keys[layer][:, :, : self._high, :], self.values[layer][:, :, : self._high, :]
 
     def key_mask(self) -> torch.Tensor:
-        """[capacity, max_seq_len], True where a position holds a real key."""
-        window = torch.arange(self.max_seq_len, device=self.lengths.device)
+        """[capacity, high], True where a position holds a real key.
+
+        Trimmed to the same width `append` returns, so the mask lines up with
+        the keys it is masking.
+        """
+        window = torch.arange(self._high, device=self.lengths.device)
         return window[None, :] < self.lengths[:, None]

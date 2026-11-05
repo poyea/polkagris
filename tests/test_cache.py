@@ -28,7 +28,9 @@ def test_reserve_then_append_makes_the_new_tokens_visible():
     k, v = kv(cache, 3, 1.0)
     keys, values = cache.append(0, k, v)
     assert cache.lengths.tolist() == [3, 3, 3]
-    assert cache.key_mask()[0].tolist() == [True] * 3 + [False] * 5
+    # Trimmed to the longest row, not to the declared window of 8.
+    assert cache.high == 3
+    assert cache.key_mask()[0].tolist() == [True] * 3
     assert torch.equal(keys[:, :, :3], k)
     assert torch.equal(values[:, :, :3], v)
 
@@ -128,7 +130,9 @@ def test_each_row_writes_at_its_own_offset():
     assert keys[1, 0, 0, 0].item() == 4.0
     # The pass row 1 sat out never touched it, so nothing was left behind.
     assert keys[1, 0, 1, 0].item() == 0.0
-    assert cache.key_mask()[1].tolist() == [True] + [False] * 7
+    # Row 0 is the longest at 4, so that is how wide the pool reads.
+    assert cache.high == 4
+    assert cache.key_mask()[1].tolist() == [True] + [False] * 3
 
 
 def test_appending_before_reserving_is_refused():
@@ -169,3 +173,40 @@ def test_a_write_narrower_than_the_pool_is_refused():
     one = torch.full((1, 2, 2, 4), 7.0)
     with pytest.raises(ValueError, match="pool holds 3 rows"):
         cache.append(0, one, one)
+
+
+def test_reads_are_bounded_by_the_longest_row_not_the_window():
+    """The window is a ceiling on length, not a per-step cost.
+
+    Attention reads every position the slice covers, so returning the whole
+    buffer would charge each step for the context the pool was declared for
+    rather than the one it is holding.
+    """
+    cache = make(capacity=3, max_seq_len=64)
+    cache.reserve(2)
+    keys, values = cache.append(0, *kv(cache, 2, 1.0))
+    assert cache.high == 2
+    assert keys.shape[-2] == 2
+    assert values.shape[-2] == 2
+    assert cache.key_mask().shape == (3, 2)
+
+    # One long row sets the width for the whole pool, since the batch is read
+    # as one tensor.
+    cache.reserve(5, torch.tensor([True, False, False]))
+    keys, _ = cache.append(0, *kv(cache, 5, 2.0))
+    assert cache.high == 7
+    assert keys.shape[-2] == 7
+    assert cache.key_mask()[0].sum().item() == 7
+    assert cache.key_mask()[1].sum().item() == 2
+
+
+def test_a_trimmed_read_still_indexes_by_absolute_position():
+    """The slice starts at 0, so buffer index equals absolute position and the
+    causal mask built from a query's position stays correct."""
+    cache = make(capacity=2, max_seq_len=32)
+    cache.reserve(3)
+    cache.append(0, *kv(cache, 3, 1.0))
+    cache.reserve(1)
+    keys, _ = cache.append(0, *kv(cache, 1, 9.0))
+    assert keys[0, 0, 3, 0].item() == 9.0
+    assert keys.shape[-2] == cache.lengths.max().item()
