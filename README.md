@@ -25,6 +25,8 @@ uv run python -m precision.fp32_vs_bf16 --reps 20
 uv run python -m compile.inspect_inductor --backend aot_eager
 uv run python -m profiling.profile_cifar --steps 10
 
+uv run python -m serving.batch_infer --pool 16
+
 uv run python -m triton_kernels.softmax                          # Linux
 uv run python -m serving.vllm_sweep --model Qwen/Qwen2.5-0.5B    # Linux
 torchrun --nproc_per_node=2 -m distributed.ddp_cifar --epochs 1
