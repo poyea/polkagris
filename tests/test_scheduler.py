@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 
 import pytest
+import torch
 
+from capstone.model import ModelConfig, Transformer
 from serving.scheduler import Request, Scheduler
 
 
@@ -151,3 +153,152 @@ def test_a_request_that_generates_nothing_is_refused():
     sched = make()
     with pytest.raises(ValueError, match="max_new_tokens"):
         sched.submit(Request(prompt=[1], max_new_tokens=0))
+
+
+def tiny_model(seed=1859, vocab=64, seq_len=32):
+    """A model whose logits depend on history.
+
+    At the default init the head copies its last input token, so every
+    sequence would continue identically and a cache that leaked between slots
+    would still pass. Widening the weights makes attention decide the token.
+    """
+    torch.manual_seed(seed)
+    cfg = ModelConfig(vocab_size=vocab, dim=32, n_layers=2, n_heads=4, seq_len=seq_len)
+    model = Transformer(cfg).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.6)
+    return model
+
+
+def alone(model, prompt, budget):
+    """The same continuation, one sequence at a time and no scheduler."""
+    tokens = list(prompt)
+    for _ in range(budget):
+        with torch.no_grad():
+            logits = model(torch.tensor([tokens]))
+        tokens.append(int(logits[0, -1].argmax()))
+    return tokens[len(prompt):]
+
+
+PROMPTS = [[3, 9, 1], [7], [5, 2, 8, 4], [11, 12], [20, 21, 22, 23, 24]]
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 3, 5])
+def test_batching_does_not_change_what_a_sequence_generates(capacity):
+    """Capacity is a throughput knob, so it must not be visible in the output.
+
+    Below 5 the slots refill mid-flight, which is where a stale key or a
+    misaligned position would show up as one sequence reading another's cache.
+    """
+    model = tiny_model()
+    budget = 7
+    expected = [alone(model, prompt, budget) for prompt in PROMPTS]
+
+    sched = Scheduler(model=model, capacity=capacity, max_seq_len=32)
+    for prompt in PROMPTS:
+        sched.submit(Request(prompt=prompt, max_new_tokens=budget))
+    finished = sched.run()
+
+    assert len(finished) == len(PROMPTS)
+    by_id = {sequence.request.id: sequence.generated for sequence in finished}
+    assert [by_id[key] for key in sorted(by_id)] == expected
+
+
+def test_the_continuations_actually_differ():
+    """Guards the test above: identical output would make it prove nothing."""
+    model = tiny_model()
+    generated = [tuple(alone(model, prompt, 7)) for prompt in PROMPTS]
+    assert len(set(generated)) == len(PROMPTS)
+    assert any(row[0] != prompt[-1] for prompt, row in zip(PROMPTS, generated))
+
+
+def test_a_drained_scheduler_hands_every_slot_and_cache_row_back():
+    model = tiny_model()
+    sched = Scheduler(model=model, capacity=2, max_seq_len=32)
+    for prompt in PROMPTS:
+        sched.submit(Request(prompt=prompt, max_new_tokens=4))
+    sched.run()
+    assert sched.pending == 0
+    assert sorted(sched._free) == [0, 1]
+    # A reused slot must not see the previous tenant's keys.
+    assert sched.cache.lengths.tolist() == [0, 0]
+    assert not sched.cache.key_mask().any()
+
+
+def test_step_returns_what_it_retired():
+    model = tiny_model()
+    sched = Scheduler(model=model, capacity=2, max_seq_len=32)
+    sched.submit(Request(prompt=[3, 9], max_new_tokens=1))
+    sched.submit(Request(prompt=[4, 1], max_new_tokens=3))
+    sched.admit()
+    # Prefill yields the first token, so a one-token budget finishes at once.
+    retired = sched.step()
+    assert [s.request.max_new_tokens for s in retired] == [1]
+    assert retired[0].done and len(retired[0].generated) == 1
+    assert len(sched.running) == 1
+
+
+def test_prefill_advances_a_fresh_slot_by_exactly_one_token():
+    model = tiny_model()
+    sched = Scheduler(model=model, capacity=1, max_seq_len=32)
+    sched.submit(Request(prompt=[5, 2, 8], max_new_tokens=9))
+    sequence = sched.admit()[0]
+    sched.step()
+    assert sequence.prefilled
+    assert len(sequence.generated) == 1
+    # The cache holds the prompt; the token just sampled is written next pass.
+    assert sched.cache.lengths[sequence.slot].item() == 3
+    sched.step()
+    assert len(sequence.generated) == 2
+    assert sched.cache.lengths[sequence.slot].item() == 4
+
+
+def test_generated_tokens_carry_no_graph():
+    """Serving never backpropagates, and a retained graph would hold every
+    activation for the life of the sequence."""
+    model = tiny_model()
+    sched = Scheduler(model=model, capacity=1, max_seq_len=32)
+    sched.submit(Request(prompt=[3, 9], max_new_tokens=3))
+    sched.run()
+    assert all(isinstance(token, int) for token in sched.finished[0].tokens)
+
+
+def test_run_restores_training_mode():
+    model = tiny_model()
+    model.train()
+    sched = Scheduler(model=model, capacity=1, max_seq_len=32)
+    sched.submit(Request(prompt=[3, 9], max_new_tokens=2))
+    sched.run()
+    assert model.training
+
+
+def test_the_cache_follows_the_weights():
+    model = tiny_model()
+    sched = Scheduler(model=model, capacity=2, max_seq_len=32)
+    sched.submit(Request(prompt=[3, 9], max_new_tokens=2))
+    sched.run()
+    assert sched.cache.keys[0].device == next(model.parameters()).device
+
+
+def test_a_stop_token_retires_mid_budget():
+    model = tiny_model()
+    budget = 7
+    expected = alone(model, [3, 9, 1], budget)
+    sched = Scheduler(model=model, capacity=1, max_seq_len=32)
+    sched.submit(Request(prompt=[3, 9, 1], max_new_tokens=budget, stop_token=expected[2]))
+    finished = sched.run()
+    assert finished[0].generated == expected[:3]
+
+
+def test_temperature_zero_is_reproducible_and_sampling_is_not_pinned_to_it():
+    model = tiny_model()
+
+    def generate(temperature, seed):
+        torch.manual_seed(seed)
+        sched = Scheduler(model=model, capacity=1, max_seq_len=32)
+        sched.submit(Request(prompt=[3, 9, 1], max_new_tokens=8, temperature=temperature))
+        return sched.run()[0].generated
+
+    assert generate(0.0, 1) == generate(0.0, 2)
+    assert any(generate(2.0, seed) != generate(0.0, 1) for seed in (1, 2, 3))
