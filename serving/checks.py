@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 
 def kv_cache_bytes(layers: int, heads: int, head_dim: int, seq: int, dtype_bytes: int = 2) -> int:
@@ -62,7 +62,71 @@ def vllm_is_needed_for_real_numbers() -> str:
 
 
 def batch_size_against_p99() -> str:
-    raise Pending("the batch size where p99 latency turns over is unmeasured")
+    """Sweep the pool and find where per-step latency stops being free.
+
+    A decode step reads the weights once whatever the batch, so until the
+    arithmetic catches up with that traffic another row costs nothing and
+    throughput rises for free. The turnover is where it stops being free, and
+    it is a property of the card rather than of this code, so it is measured
+    here rather than written down.
+    """
+    import random
+    import statistics
+
+    import torch
+
+    if not torch.cuda.is_available():
+        raise Skip("the turnover is a bandwidth against arithmetic trade, which needs a GPU")
+
+    from capstone.model import ModelConfig, Transformer
+    from polkagris.bench import set_seed
+    from serving.scheduler import Request, Scheduler
+
+    set_seed()
+    pools = (1, 8, 32, 128)
+    steps, prompt = 8, 8
+    cfg = ModelConfig(vocab_size=4096, dim=512, n_layers=8, n_heads=8, seq_len=128)
+    model = Transformer(cfg).eval().cuda()
+
+    def fresh(pool: int) -> Scheduler:
+        sched = Scheduler(model=model, capacity=pool, max_seq_len=prompt + 6 * steps + 8)
+        for _ in range(pool):
+            sched.submit(Request(prompt=[5] * prompt, max_new_tokens=6 * steps))
+        sched.admit()
+        sched.step()
+        return sched
+
+    def burst(sched: Scheduler) -> list[float]:
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+        for i in range(steps):
+            starts[i].record()
+            sched.step()
+            ends[i].record()
+        torch.cuda.synchronize()
+        return [a.elapsed_time(b) for a, b in zip(starts, ends)]
+
+    # Bursts are interleaved in a shuffled order because the clock ramps as the
+    # sweep runs. Measuring each pool to completion in turn hands the later ones
+    # a warmer card and reads the ramp as a batching effect.
+    samples: dict[int, list[float]] = {pool: [] for pool in pools}
+    scheds = {pool: fresh(pool) for pool in pools}
+    order = [pool for pool in pools for _ in range(4)]
+    random.Random(1859).shuffle(order)
+    for pool in order:
+        samples[pool] += burst(scheds[pool])
+
+    p99 = {pool: statistics.quantiles(rows, n=100)[98] for pool, rows in samples.items()}
+    floor = min(p99.values())
+    free = [pool for pool in pools if p99[pool] <= 1.5 * floor]
+    knee = max(free)
+    gain = (knee / (p99[knee] / 1000.0)) / (pools[0] / (p99[pools[0]] / 1000.0))
+    assert knee > pools[0], f"batching bought nothing: p99 {p99}"
+    return (
+        f"p99 per step holds near {floor:.0f} ms out to a pool of {knee}, "
+        f"{gain:.0f}x the tokens/s of a pool of {pools[0]} at the same latency"
+    )
 
 
 CHECKS = [
