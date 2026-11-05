@@ -13,7 +13,7 @@ import torch
 from capstone.model import ModelConfig, Transformer
 from capstone.ops import get_ops
 from polkagris import set_seed
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 SMALL = ModelConfig(vocab_size=65, dim=64, n_layers=2, n_heads=4, seq_len=32)
 
@@ -165,7 +165,69 @@ def the_triton_backend_needs_a_triton_box() -> str:
 
 
 def memory_ceiling_and_bf16_recovery() -> str:
-    raise Pending("the dim/layers ceiling and its bf16 recovery are unmeasured")
+    """What sets the training ceiling, and how little autocast moves it.
+
+    Phase 04 measures bf16 halving memory, which is an inference result. In
+    training the optimizer holds fp32 moments and autocast keeps fp32 master
+    weights, so only activations narrow, and autocast also caches a bf16 copy
+    of each weight it casts. The saving is therefore shape-dependent and can
+    go either way, which is the point worth recording.
+    """
+    import gc
+
+    if not torch.cuda.is_available():
+        raise Skip("a memory ceiling needs the device whose memory it is")
+
+    def peak_mib(dtype: torch.dtype | None, dim: int, layers: int, batch: int, seq: int):
+        model = opt = None
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            cfg = replace(
+                ModelConfig(vocab_size=4096, n_heads=8, seq_len=seq), dim=dim, n_layers=layers
+            )
+            set_seed()
+            model = Transformer(cfg).cuda()
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            tokens = torch.randint(0, cfg.vocab_size, (batch, seq), device="cuda")
+            context = torch.autocast("cuda", dtype=dtype) if dtype else torch.enable_grad()
+            with context:
+                logits = model(tokens)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.float().view(-1, cfg.vocab_size), tokens.view(-1)
+                )
+            loss.backward()
+            opt.step()
+            torch.cuda.synchronize()
+            params = sum(p.numel() for p in model.parameters())
+            return torch.cuda.max_memory_allocated() / 2**20, params
+        finally:
+            del model, opt
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+    # Two shapes with the same parameter count and different activation shares,
+    # since that share is the only part autocast can narrow.
+    shapes = ((512, 6, 16, 256), (512, 6, 8, 512))
+    savings, params = [], 0
+    for dim, layers, batch, seq in shapes:
+        wide, params = peak_mib(None, dim, layers, batch, seq)
+        narrow, _ = peak_mib(torch.bfloat16, dim, layers, batch, seq)
+        savings.append(1.0 - narrow / wide)
+
+    # AdamW in fp32 is the parameter, its gradient and two moments: 16 bytes a
+    # parameter that autocast never touches, whatever the activations do.
+    total = torch.cuda.get_device_properties(0).total_memory
+    ceiling = total / 16
+    best, worst = max(savings), min(savings)
+    assert best < 0.3, f"a {best:.0%} saving would mean autocast reaches the weights, which it does not"
+    return (
+        f"bf16 moves the step between {worst:+.0%} and {best:+.0%} across two activation shares, "
+        f"not the halving inference shows; fp32 AdamW state is 16 B/param, so this device is "
+        f"exhausted by optimizer state alone near {ceiling / 1e6:.0f}M params "
+        f"({params / 1e6:.1f}M here) and autocast does not raise that"
+    )
 
 
 CHECKS = [
