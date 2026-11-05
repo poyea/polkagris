@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from autodiff.micrograd import Value
-from polkagris.checks import Pending, run
+from polkagris.checks import run
 
 
 def count_nodes(out: Value) -> int:
@@ -69,15 +69,31 @@ def reciprocal_has_no_reflected_operator() -> str:
     raise AssertionError("__rtruediv__ exists now, so the composed sigmoid above can be simplified")
 
 
-def fused_sigmoid_op_exists() -> str:
-    if hasattr(Value, "sigmoid"):
-        x = Value(0.7)
+def the_fused_sigmoid_survives_what_composition_cannot() -> str:
+    """Why the op is worth having, rather than only that it is correct."""
+    for probe in (0.7, -0.7, 30.0, -30.0):
+        x = Value(probe)
         s = x.sigmoid()
         s.backward()
         expected = s.data * (1.0 - s.data)
-        assert abs(x.grad - expected) < 1e-12, f"{x.grad} != {expected}"
-        return f"Value.sigmoid backward is correct: {x.grad:.6f}"
-    raise Pending("Value has no sigmoid(); the composed form above is used instead")
+        assert abs(x.grad - expected) < 1e-12, f"at {probe}: {x.grad} != {expected}"
+
+    # The composed form raises here, since it reaches exp(-x) for x well below
+    # zero. Branching on the sign keeps the exponent negative either way, which
+    # is the whole return on spending a node on this.
+    far = -1000.0
+    try:
+        (1.0 + (-Value(far)).exp()) ** -1.0
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError(f"the composed form was expected to overflow at {far}")
+
+    x = Value(far)
+    s = x.sigmoid()
+    s.backward()
+    assert s.data == 0.0 and x.grad == 0.0, f"expected a clean floor, got {s.data}, {x.grad}"
+    return f"correct on both sign branches, and saturates to 0 at {far:.0f} where composing overflows"
 
 
 def break_gradient_accumulation_on_purpose() -> str:
@@ -119,7 +135,7 @@ CHECKS = [
     reciprocal_has_no_reflected_operator,
     break_gradient_accumulation_on_purpose,
     exp_of_a_large_input_overflows,
-    fused_sigmoid_op_exists,
+    the_fused_sigmoid_survives_what_composition_cannot,
 ]
 
 if __name__ == "__main__":
