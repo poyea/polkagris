@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from polkagris import set_seed
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 
 def fp16_overflows_where_bf16_does_not() -> str:
@@ -122,7 +122,68 @@ def ops_autocast_keeps_in_fp32() -> str:
 
 
 def accuracy_under_bf16() -> str:
-    raise Pending("final accuracy in fp32 versus bf16 is unmeasured")
+    """Whether the halved mantissa costs accuracy, against run-to-run spread.
+
+    One run of each proves nothing here: the seed moves the final number by
+    more than the dtype does, and a single pair came out with bf16 ahead. So
+    train both at several seeds and compare the gap to the spread. Six short
+    runs, so this is the slow check in this file.
+    """
+    import contextlib
+    import io
+    import statistics
+    from dataclasses import replace
+
+    from torch.utils.data import DataLoader, Subset
+
+    # download=False: a check measures, it does not fetch 64 MB behind your back.
+    from torchvision import datasets, transforms
+
+    from polkagris.data import DATA_ROOT, get_device
+    from training.config import TrainConfig
+    from training.loop import fit
+    from training.mnist_mlp import build_model
+
+    cfg = TrainConfig()
+    tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    try:
+        train = datasets.MNIST(DATA_ROOT, train=True, download=False, transform=tf)
+        test = datasets.MNIST(DATA_ROOT, train=False, download=False, transform=tf)
+    except RuntimeError as exc:
+        raise Skip(f"MNIST is not in {DATA_ROOT}; run -m training.mnist_mlp once") from exc
+
+    device = get_device()
+    indices = torch.randperm(len(train), generator=torch.Generator().manual_seed(0))[:12000]
+    subset = Subset(train, indices.tolist())
+    held_out = DataLoader(Subset(test, list(range(2000))), batch_size=512)
+    seeds = (1859, 2, 3)
+
+    def final_accuracy(dtype: torch.dtype | None, seed: int) -> float:
+        torch.manual_seed(seed)
+        model = build_model()
+        loader = DataLoader(
+            subset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fit(model, loader, held_out, replace(cfg, epochs=4), device, dtype)
+
+    runs = {
+        name: [final_accuracy(dtype, seed) for seed in seeds]
+        for name, dtype in (("fp32", None), ("bf16", torch.bfloat16))
+    }
+    spread = max(max(rows) - min(rows) for rows in runs.values())
+    gap = statistics.fmean(runs["fp32"]) - statistics.fmean(runs["bf16"])
+    assert abs(gap) < spread, (
+        f"a {gap:+.2%} gap stands clear of a {spread:.2%} spread, so the dtype is doing it"
+    )
+    return (
+        f"fp32 {statistics.fmean(runs['fp32']):.2%} against bf16 "
+        f"{statistics.fmean(runs['bf16']):.2%} over {len(seeds)} seeds: a {abs(gap):.2%} gap "
+        f"inside a {spread:.2%} seed-to-seed spread, so the mantissa is not what moves it"
+    )
 
 
 CHECKS = [
