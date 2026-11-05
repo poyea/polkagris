@@ -78,7 +78,23 @@ def a_gpu_trace_needs_a_gpu() -> str:
 
 
 def top_kernels_classified() -> str:
-    raise Pending("the ncu pass that labels the top five kernels has not been run")
+    """Labelling the top kernels by counter, which needs more than the tool.
+
+    The torch profiler already names the dominant operator and times every
+    kernel, but it reports no bytes moved and no FLOPs for these, so it cannot
+    say which roof a kernel is under. That is what Nsight Compute is for, and
+    reading counters is privileged: the driver restricts them to an elevated
+    user by default, so an unprivileged pass exits with ERR_NVGPUCTRPERM and
+    profiles nothing, whether or not the tool is installed.
+    """
+    import shutil
+
+    if not shutil.which("ncu"):
+        raise Skip("ncu is not on PATH")
+    raise Pending(
+        "ncu is installed, but counters need the driver's profiling permission widened "
+        "beyond an elevated user, so the top five are timed and not yet labelled"
+    )
 
 
 CHECKS = [
