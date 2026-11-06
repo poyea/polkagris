@@ -139,6 +139,80 @@ def achieved_bandwidth_against_spec() -> str:
     )
 
 
+def what_the_naive_matmul_actually_costs() -> str:
+    """Run the kernel the prediction above is about, and see where it lands.
+
+    The prediction is a source-level count: one thread per output re-reads a
+    full row and column, so 2n^3 words cross the boundary. That is true of the
+    instructions and not of the DRAM, because the cache serves most of the
+    re-reads, and the gap between the two is the point.
+    """
+    import torch
+
+    from polkagris import nvrtc
+
+    try:
+        kernel = nvrtc.load(HERE / "naive_matmul.cu", "naive_matmul")
+    except nvrtc.Unavailable as exc:
+        raise Skip(str(exc)) from exc
+
+    n = 1024
+    torch.manual_seed(1859)
+    a = torch.randn(n, n, device="cuda")
+    b = torch.randn(n, n, device="cuda")
+    c = torch.empty(n, n, device="cuda")
+    side = 16
+    grid = ((n + side - 1) // side, (n + side - 1) // side)
+
+    def launch() -> None:
+        kernel.launch(grid, (side, side), a, b, c, n, n, n)
+
+    launch()
+    torch.cuda.synchronize()
+    assert torch.allclose(c, a @ b, atol=2e-3, rtol=2e-3), "the kernel ran but got the wrong C"
+
+    def median_ms(fn, reps: int = 20) -> float:
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        for i in range(reps):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        torch.cuda.synchronize()
+        times = sorted(x.elapsed_time(y) for x, y in zip(starts, ends))
+        return times[len(times) // 2]
+
+    seconds = median_ms(launch) / 1e3
+    flops = 2.0 * n**3
+    source_bytes = 2.0 * n**3 * 4
+
+    # Both roofs, measured, so the two claims below are against this device.
+    span = 1 << 24
+    source = torch.empty(span, device="cuda")
+    target = torch.empty(span, device="cuda")
+    byte_rate = (2 * span * 4) / (median_ms(lambda: target.copy_(source)) / 1e3)
+    wide = 2048
+    left = torch.randn(wide, wide, device="cuda")
+    right = torch.randn(wide, wide, device="cuda")
+    flop_rate = (2.0 * wide**3) / (median_ms(lambda: left @ right) / 1e3)
+
+    achieved_flops = flops / seconds
+    apparent = source_bytes / seconds
+    assert achieved_flops < 0.25 * flop_rate, "this kernel is not supposed to reach the fp32 roof"
+    # If the source-level traffic really crossed DRAM it could not exceed the
+    # bandwidth roof. It does, so most of those reads never got that far.
+    assert apparent > byte_rate, f"{apparent / 1e9:.0f} GB/s apparent is below the roof"
+    return (
+        f"{achieved_flops / flop_rate:.0%} of the fp32 roof, so not compute-bound as predicted; "
+        f"but its {source_bytes / 2**30:.1f} GiB of source-level reads imply "
+        f"{apparent / 1e9:.0f} GB/s against a {byte_rate / 1e9:.0f} GB/s roof, "
+        f"{apparent / byte_rate:.1f}x over, so the cache absorbs the reuse the source throws away"
+    )
+
+
 CHECKS = [
     vector_add_moves_three_words_per_add,
     naive_matmul_is_compute_shaped_but_runs_memory_bound,
@@ -146,6 +220,7 @@ CHECKS = [
     the_grid_must_cover_a_ragged_tail,
     the_host_programs_compile,
     achieved_bandwidth_against_spec,
+    what_the_naive_matmul_actually_costs,
 ]
 
 if __name__ == "__main__":
