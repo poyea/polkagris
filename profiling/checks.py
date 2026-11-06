@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from polkagris import set_seed
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 
 def intensity(flops: float, bytes_moved: float) -> float:
@@ -78,22 +78,90 @@ def a_gpu_trace_needs_a_gpu() -> str:
 
 
 def top_kernels_classified() -> str:
-    """Labelling the top kernels by counter, which needs more than the tool.
+    """Label the step's heaviest operators against this device's two roofs.
 
-    The torch profiler already names the dominant operator and times every
-    kernel, but it reports no bytes moved and no FLOPs for these, so it cannot
-    say which roof a kernel is under. That is what Nsight Compute is for, and
-    reading counters is privileged: the driver restricts them to an elevated
-    user by default, so an unprivileged pass exits with ERR_NVGPUCTRPERM and
-    profiles nothing, whether or not the tool is installed.
+    Nsight Compute would read this off counters, but counter access is
+    privileged and an unprivileged pass exits with ERR_NVGPUCTRPERM before
+    reaching a kernel. The labels do not need counters: measure the two roofs
+    on the device, count each operator's traffic and arithmetic from its
+    shapes, and the ridge point between them decides which roof it is under.
     """
-    import shutil
+    if not torch.cuda.is_available():
+        raise Skip("the roofs belong to a device, so there is nothing to measure against")
 
-    if not shutil.which("ncu"):
-        raise Skip("ncu is not on PATH")
-    raise Pending(
-        "ncu is installed, but counters need the driver's profiling permission widened "
-        "beyond an elevated user, so the top five are timed and not yet labelled"
+    def median_ms(fn, warmup: int = 5, reps: int = 20) -> float:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        for i in range(reps):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        torch.cuda.synchronize()
+        times = sorted(a.elapsed_time(b) for a, b in zip(starts, ends))
+        return times[len(times) // 2]
+
+    # Roof one: a copy does two words of traffic per element and no arithmetic,
+    # so it measures bandwidth and nothing else.
+    count = 1 << 24
+    source = torch.empty(count, device="cuda")
+    target = torch.empty(count, device="cuda")
+    byte_rate = (2 * count * 4) / (median_ms(lambda: target.copy_(source)) / 1e3)
+
+    # Roof two: a square matmul large enough to be tiled measures the fp32 rate.
+    side = 2048
+    left = torch.randn(side, side, device="cuda")
+    right = torch.randn(side, side, device="cuda")
+    flop_rate = (2.0 * side**3) / (median_ms(lambda: left @ right) / 1e3)
+    ridge = flop_rate / byte_rate
+
+    # The CIFAR step's convolutions, which is where its time goes.
+    batch = 128
+    layers = (
+        (3, 64, 32),
+        (64, 64, 32),
+        (64, 128, 16),
+        (128, 128, 16),
+        (128, 256, 8),
+        (256, 256, 8),
+    )
+    rows = []
+    for fan_in, fan_out, side_px in layers:
+        conv = nn.Conv2d(fan_in, fan_out, 3, padding=1, bias=False).cuda()
+        feature = torch.randn(batch, fan_in, side_px, side_px, device="cuda")
+        elapsed = median_ms(lambda c=conv, f=feature: c(f)) / 1e3
+        pixels = side_px * side_px
+        flops = 2.0 * batch * fan_out * fan_in * 9 * pixels
+        moved = 4.0 * (batch * fan_in * pixels + batch * fan_out * pixels + fan_out * fan_in * 9)
+        rows.append(
+            (f"{fan_in}->{fan_out}@{side_px}", elapsed, intensity(flops, moved), flops, moved)
+        )
+    rows.sort(key=lambda row: -row[1])
+
+    under_memory = [row for row in rows if row[2] < ridge]
+    under_compute = [row for row in rows if row[2] >= ridge]
+    assert under_memory and under_compute, f"expected both roofs in one step, got {rows}"
+
+    # The one memory-bound layer should be near the bandwidth roof, which is
+    # what makes the label mean something rather than just sorting a ratio.
+    thin = under_memory[0]
+    achieved = thin[4] / thin[1] / byte_rate
+    assert achieved > 0.4, f"a memory-bound layer at {achieved:.0%} of the roof is not bound by it"
+
+    # Credited against direct convolution. A rate past the matmul roof is not
+    # the card going faster than itself, it is cuDNN doing algebraically fewer
+    # multiplies than the 3x3 definition, which is what its winograd kernels are.
+    fastest = max(row[3] / row[1] for row in under_compute)
+    beyond = " and one past the fp32 roof, so cuDNN is not convolving directly" if (
+        fastest > flop_rate
+    ) else ""
+    return (
+        f"{byte_rate / 1e9:.0f} GB/s and {flop_rate / 1e12:.2f} TFLOP/s give a "
+        f"{ridge:.0f} FLOP/byte ridge; of the step's heaviest layers "
+        f"{len(under_compute)} sit above it and {thin[0]} sits below at {thin[2]:.0f}, "
+        f"at {achieved:.0%} of the bandwidth roof{beyond}"
     )
 
 
