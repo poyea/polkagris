@@ -92,7 +92,7 @@ def fraction_of_cublas_reached() -> str:
     """
     import torch
 
-    from cuda_primitives import nvrtc
+    from polkagris import nvrtc
 
     try:
         kernels = nvrtc.load_many(HERE / "sgemm.cu", [name for _, name, _ in LADDER])

@@ -4,13 +4,13 @@
 """Run a .cu kernel without a host compiler.
 
 `nvcc` needs `cl.exe` even to emit device code, because it preprocesses
-through the host compiler, so on a box without MSVC the kernels here cannot
+through the host compiler, so on a box without MSVC the .cu kernels cannot
 be built the usual way. NVRTC compiles the same source to PTX on its own, and
 the driver API loads and launches it, both reachable through ctypes. Device
 memory comes from torch tensors, so there is no allocation to manage here.
 
-This runs the kernel, not the host program: `host_vector_add.cpp` still needs
-a host compiler, and so does `make run`.
+This runs the kernel, not the host program: `host_vector_add.cpp` (in
+`cuda_primitives/`) still needs a host compiler, and so does `make run`.
 """
 
 from __future__ import annotations

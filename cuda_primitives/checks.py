@@ -90,7 +90,7 @@ def achieved_bandwidth_against_spec() -> str:
     """
     import torch
 
-    from cuda_primitives import nvrtc
+    from polkagris import nvrtc
 
     try:
         kernel = nvrtc.load(HERE / "vector_add.cu", "vector_add")

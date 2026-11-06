@@ -12,7 +12,7 @@ compiler log.
 
 import pytest
 
-from cuda_primitives.nvrtc import _dims, _read_source
+from polkagris.nvrtc import _dims, _read_source
 
 
 def write(tmp_path, name, text):
