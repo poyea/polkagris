@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 HERE = Path(__file__).resolve().parent
 
@@ -79,7 +79,64 @@ def the_host_programs_compile() -> str:
 
 
 def achieved_bandwidth_against_spec() -> str:
-    raise Pending("vector_add GB/s against the card spec is unmeasured")
+    """Run the kernel in this directory and see what fraction of the roof it gets.
+
+    The host programs need a host compiler and this does not: NVRTC compiles
+    the same source and the driver API launches it, so the prediction above
+    gets checked against the kernel it is about rather than a stand-in.
+
+    The roof is measured here too, by a copy, because a number from a spec
+    sheet is not what this machine does.
+    """
+    import torch
+
+    from cuda_primitives import nvrtc
+
+    try:
+        kernel = nvrtc.load(HERE / "vector_add.cu", "vector_add")
+    except nvrtc.Unavailable as exc:
+        raise Skip(str(exc)) from exc
+
+    n = 1 << 24
+    block = 256
+    grid = (n + block - 1) // block
+    a = torch.rand(n, device="cuda")
+    b = torch.rand(n, device="cuda")
+    c = torch.empty(n, device="cuda")
+
+    def launch() -> None:
+        kernel.launch(grid, block, a, b, c, n)
+
+    launch()
+    torch.cuda.synchronize()
+    assert torch.allclose(c, a + b), "the kernel ran but did not add"
+
+    def median_ms(fn, reps: int = 50) -> float:
+        for _ in range(10):
+            fn()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        for i in range(reps):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        torch.cuda.synchronize()
+        times = sorted(x.elapsed_time(y) for x, y in zip(starts, ends))
+        return times[len(times) // 2]
+
+    moved = 3 * n * 4
+    achieved = moved / (median_ms(launch) / 1e3) / 1e9
+    # A copy is the same traffic pattern with two words per element instead of
+    # three, so it stands in for the roof this kernel is trying to reach.
+    spare = torch.empty(n, device="cuda")
+    roof = (2 * n * 4) / (median_ms(lambda: spare.copy_(a)) / 1e3) / 1e9
+    fraction = achieved / roof
+    assert fraction > 0.7, f"{achieved:.0f} GB/s against a {roof:.0f} GB/s roof is not bandwidth-bound"
+    return (
+        f"{achieved:.0f} GB/s moving {moved / 2**20:.0f} MiB, which is {fraction:.0%} of a "
+        f"{roof:.0f} GB/s copy: the prediction above holds, the kernel is at the roof"
+    )
 
 
 CHECKS = [
