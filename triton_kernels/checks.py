@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import math
+import random
+import statistics
 
 import torch
 
 from polkagris import set_seed
-from polkagris.checks import Pending, Skip, run
+from polkagris.checks import Skip, run
 
 
 def have_triton() -> tuple[object, object]:
@@ -78,12 +80,111 @@ def the_kernels_need_a_triton_box() -> str:
     return f"triton {triton.__version__} present; run triton_kernels.softmax for real numbers"
 
 
+def _median_ms(call, reps: int = 15) -> float:
+    for _ in range(4):
+        call()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        call()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return statistics.median(times)
+
+
+def _interleaved(settings: dict, rounds: int = 3) -> dict:
+    """Time each setting several times in shuffled order.
+
+    Timing one setting to completion before the next hands the later ones a
+    boosted clock and reads the ramp as an effect of the setting.
+    """
+    order = list(settings) * rounds
+    random.Random(1859).shuffle(order)
+    gathered: dict = {key: [] for key in settings}
+    for key in order:
+        gathered[key].append(_median_ms(settings[key]))
+    return {key: statistics.median(samples) for key, samples in gathered.items()}
+
+
 def block_size_sweep() -> str:
-    raise Pending("BLOCK sweep timings are unmeasured")
+    have_triton()
+    from triton_kernels.softmax import triton_softmax
+
+    set_seed()
+    rows = 1024
+    widths = (128, 512, 2048, 8192)
+    inputs = {
+        cols: torch.randn(rows, cols, device="cuda", dtype=torch.float16)
+        for cols in widths
+    }
+
+    settings = {}
+    for cols in widths:
+        settings[cols, "triton"] = lambda c=cols: triton_softmax(inputs[c])
+        settings[cols, "torch"] = lambda c=cols: torch.softmax(inputs[c], dim=1)
+    timed = _interleaved(settings)
+
+    ratios, rates = {}, {}
+    for cols in widths:
+        triton_ms = timed[cols, "triton"]
+        torch_ms = timed[cols, "torch"]
+        ratios[cols] = torch_ms / triton_ms
+        rates[cols] = rows * cols * 2 * 2 / triton_ms / 1e6
+
+    assert ratios[widths[0]] < 1.0, (
+        f"one row per program should lose at BLOCK={widths[0]}, got {ratios[widths[0]]:.2f}x"
+    )
+    assert ratios[widths[-1]] > ratios[widths[0]], "the ratio should improve as the row grows"
+    assert rates[widths[-1]] > rates[widths[0]] * 4, "wider rows should move far more bandwidth"
+
+    return (
+        f"BLOCK={widths[0]} runs at {ratios[widths[0]]:.2f}x torch and "
+        f"{rates[widths[0]]:.0f} GB/s, BLOCK={widths[-1]} at {ratios[widths[-1]]:.2f}x and "
+        f"{rates[widths[-1]]:.0f} GB/s: one program per row only pays once the row is wide "
+        "enough to cover the launch, and the crossover is where that happens"
+    )
 
 
 def tiling_asymmetry_measured() -> str:
-    raise Pending("the BLOCK_M/BLOCK_N asymmetry is not backed by counters yet")
+    have_triton()
+    from triton_kernels.tiled_attention import tiled_attention
+
+    set_seed()
+    heads, seq, dim = 8, 1024, 64
+    shape = (heads, seq, dim)
+    q, k, v = (torch.randn(shape, device="cuda", dtype=torch.float16) for _ in range(3))
+
+    def predicted_mb(block_m: int, block_n: int) -> float:
+        tiles_m, tiles_n = seq / block_m, seq / block_n
+        return tiles_m * tiles_n * (block_n * dim * 2) * 4 / 1e6
+
+    pairs = ((32, 32), (32, 128), (128, 32))
+    measured = _interleaved(
+        {
+            pair: (lambda bm=pair[0], bn=pair[1]: tiled_attention(q, k, v, bm, bn))
+            for pair in pairs
+        },
+        rounds=2,
+    )
+
+    wide, tall = (32, 128), (128, 32)
+    assert predicted_mb(*tall) < predicted_mb(*wide), "the model should favour the tall tile"
+    assert measured[tall] > measured[wide], (
+        f"the tall tile moves less predicted traffic yet measured "
+        f"{measured[tall]:.1f} ms against {measured[wide]:.1f} ms; "
+        "if it is now faster the traffic model has stopped being wrong"
+    )
+
+    return (
+        f"BLOCK_M={tall[0]},BLOCK_N={tall[1]} is predicted to move "
+        f"{predicted_mb(*tall):.1f} MB against {predicted_mb(*wide):.1f} MB reversed, yet runs "
+        f"{measured[tall]:.1f} ms against {measured[wide]:.1f} ms. The traffic model orders these "
+        "backwards: it counts tiles streamed and ignores that a larger tile spends more shared "
+        "memory and registers per program, which costs the occupancy that hides the latency"
+    )
 
 
 CHECKS = [
